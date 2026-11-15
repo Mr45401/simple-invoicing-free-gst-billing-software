@@ -14,39 +14,74 @@ from src.services.uqc import HSN_UQC_BY_UNIT, hsn_uqc, uqc_for_unit
     ("Liters", "LTR"),
     ("Ltrs", "LTR"),
     ("litre", "LTR"),
+    ("ltr.", "LTR"),
+    ("Ltrs.", "LTR"),
     ("Bag", "BAG"),
     ("Bags", "BAG"),
     ("Bottle", "BTL"),
     ("Bottles", "BTL"),
     ("Packet", "PAC"),
     ("Packets", "PAC"),
+    ("pack", "PAC"),
+    ("packs", "PAC"),
+    ("pkt", "PAC"),
+    ("pkt.", "PAC"),
+    ("pkts", "PAC"),
     ("Quintal", "QTL"),
     ("Tonnes", "TON"),
     ("Meters", "MTR"),
     ("Metres", "MTR"),
+    ("mtrs", "MTR"),
+    ("mtr.", "MTR"),
+    ("cm", "CMS"),
     ("Sets", "SET"),
     ("Pairs", "PRS"),
     ("Boxes", "BOX"),
     ("Kilograms", "KGS"),
+    ("kg.", "KGS"),
+    ("kgs.", "KGS"),
+    ("gms.", "GMS"),
     ("Cartons", "CTN"),
+    ("pc", "PCS"),
+    ("pc.", "PCS"),
+    ("pcs.", "PCS"),
+    ("no", "NOS"),
+    ("no.", "NOS"),
+    ("nos.", "NOS"),
+    ("number", "NOS"),
+    ("numbers", "NOS"),
+    ("units", "UNT"),
+    ("unit.", "UNT"),
+    ("sq ft", "SQF"),
+    ("sq. ft", "SQF"),
+    ("sq. ft.", "SQF"),
+    ("sq.ft", "SQF"),
+    ("sqft", "SQF"),
+    ("  Sq.  Ft. ", "SQF"),
+    ("square feet", "SQF"),
+    ("sq m", "SQM"),
+    ("sq. m", "SQM"),
+    ("sqm", "SQM"),
 ])
 def test_plurals_and_common_spellings_map_to_the_right_code(unit, expected):
     assert uqc_for_unit(unit) == expected
 
 
-@pytest.mark.parametrize("unit", ["BAG", "CTN", "QTL", "bag", "ctn", "qtl"])
+@pytest.mark.parametrize("unit", ["BAG", "CTN", "QTL", "bag", "ctn", "qtl", "BAG.", "doz."])
 def test_a_unit_that_already_is_a_uqc_code_is_used_as_is(unit):
-    assert uqc_for_unit(unit) == unit.strip().upper()
+    assert uqc_for_unit(unit) == unit.strip(" .").upper()
 
 
-@pytest.mark.parametrize("unit", ["Ounce", "Ounces", "Hours", None, ""])
+@pytest.mark.parametrize("unit", ["Ounce", "Ounces", "feet", "ft", "ft.", "Hours", ".", "   ", None, ""])
 def test_an_unmapped_unit_falls_back_to_oth_not_nos(unit):
     assert uqc_for_unit(unit) == "OTH"
 
 
 def test_services_still_file_as_na():
     assert hsn_uqc("998313", "Pieces") == "NA"
+    assert hsn_uqc("998313", "sq. ft") == "NA"
     assert hsn_uqc("1508", "Litres") == "LTR"
+    assert hsn_uqc("6907", "sq. ft") == "SQF"
 
 
 def test_every_mapped_unit_is_a_valid_nic_code():
