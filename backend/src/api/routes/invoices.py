@@ -1,7 +1,7 @@
 import csv
 import logging
 from io import BytesIO, StringIO
-from datetime import date
+from datetime import date, datetime  # noqa: F401
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
