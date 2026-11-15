@@ -193,3 +193,152 @@ def test_dashboard_current_month_stops_at_next_month(
     assert data["charts"]["monthly"][-1]["receipts"] == 25
     assert data["sales"]["total_sales"] == 150
     assert data["payments"]["received_total"] == 75
+
+
+def _overdue_bucket_totals(ageing_body):
+    overdue_buckets = [b for b in ageing_body["buckets"] if b["key"] != "not_yet_due"]
+    return (
+        sum(b["total_remaining"] for b in overdue_buckets),
+        sum(b["invoice_count"] for b in overdue_buckets),
+    )
+
+
+def test_dashboard_receivables_excludes_ledger_offset_by_larger_payable(client):
+    today = date.today()
+    overdue_due_date = (today - timedelta(days=40)).isoformat()
+    product = _create_product(client, "DASH-OFFSET", "Offset Widget", 200, initial_quantity=10)
+    alpha = _create_ledger(client, "Alpha")
+
+    sales_res = client.post(
+        "/api/invoices/",
+        json={
+            "voucher_type": "sales",
+            "ledger_id": alpha,
+            "invoice_date": today.isoformat(),
+            "due_date": overdue_due_date,
+            "items": [{"product_id": product, "quantity": 1, "unit_price": 200, "gst_rate": 18}],
+        },
+    )
+    assert sales_res.status_code == 200, sales_res.text
+    assert sales_res.json()["total_amount"] == 236
+
+    purchase_res = client.post(
+        "/api/invoices/",
+        json={
+            "voucher_type": "purchase",
+            "ledger_id": alpha,
+            "supplier_invoice_number": "ALPHA-PUR-1",
+            "invoice_date": today.isoformat(),
+            "items": [{"product_id": product, "quantity": 1, "unit_price": 300, "gst_rate": 18}],
+        },
+    )
+    assert purchase_res.status_code == 200, purchase_res.text
+    assert purchase_res.json()["total_amount"] == 354
+
+    metrics_res = client.get("/api/dashboard/metrics")
+    assert metrics_res.status_code == 200, metrics_res.text
+    receivables = metrics_res.json()["receivables"]
+
+    ageing_res = client.get("/api/invoices/dues/ageing")
+    assert ageing_res.status_code == 200, ageing_res.text
+    ageing = ageing_res.json()
+    ageing_overdue_amount, ageing_overdue_count = _overdue_bucket_totals(ageing)
+
+    assert ageing["total_remaining"] == 0
+    assert ageing_overdue_amount == 0
+    assert receivables["outstanding_amount"] == ageing["total_remaining"]
+    assert receivables["overdue_amount"] == ageing_overdue_amount
+    assert receivables["overdue_count"] == ageing_overdue_count
+    assert receivables["unpaid_count"] == 1
+
+    # Once the offsetting purchase invoice is cancelled, both surfaces report the overdue sale again.
+    cancel_res = client.delete(f"/api/invoices/{purchase_res.json()['id']}")
+    assert cancel_res.status_code == 200, cancel_res.text
+
+    receivables_after = client.get("/api/dashboard/metrics").json()["receivables"]
+    ageing_after = client.get("/api/invoices/dues/ageing").json()
+    after_overdue_amount, after_overdue_count = _overdue_bucket_totals(ageing_after)
+
+    assert ageing_after["total_remaining"] == 236
+    assert receivables_after["outstanding_amount"] == ageing_after["total_remaining"]
+    assert receivables_after["overdue_amount"] == after_overdue_amount == 236
+    assert receivables_after["overdue_count"] == after_overdue_count == 1
+
+
+def test_dashboard_receivables_matches_ageing_across_offset_and_open_ledgers(client):
+    today = date.today()
+    overdue_due_date = (today - timedelta(days=20)).isoformat()
+    future_due_date = (today + timedelta(days=10)).isoformat()
+    product = _create_product(client, "DASH-MIX", "Mixed Widget", 100, gst_rate=0, initial_quantity=20)
+
+    net_zero_ledger = _create_ledger(client, "Net Zero Party")
+    partial_offset_ledger = _create_ledger(client, "Partial Offset Party")
+    upcoming_ledger = _create_ledger(client, "Upcoming Party")
+
+    # 1. Exact net zero (200 receivable vs 200 payable) -> hidden from Dues & Dashboard totals.
+    assert client.post(
+        "/api/invoices/",
+        json={
+            "voucher_type": "sales",
+            "ledger_id": net_zero_ledger,
+            "invoice_date": today.isoformat(),
+            "due_date": overdue_due_date,
+            "items": [{"product_id": product, "quantity": 1, "unit_price": 200, "gst_rate": 0}],
+        },
+    ).status_code == 200
+    assert client.post(
+        "/api/invoices/",
+        json={
+            "voucher_type": "purchase",
+            "ledger_id": net_zero_ledger,
+            "supplier_invoice_number": "NZ-PUR-1",
+            "invoice_date": today.isoformat(),
+            "items": [{"product_id": product, "quantity": 1, "unit_price": 200, "gst_rate": 0}],
+        },
+    ).status_code == 200
+
+    # 2. Sales exceed purchases (300 overdue receivable vs 100 payable) -> remains due (300).
+    assert client.post(
+        "/api/invoices/",
+        json={
+            "voucher_type": "sales",
+            "ledger_id": partial_offset_ledger,
+            "invoice_date": today.isoformat(),
+            "due_date": overdue_due_date,
+            "items": [{"product_id": product, "quantity": 1, "unit_price": 300, "gst_rate": 0}],
+        },
+    ).status_code == 200
+    assert client.post(
+        "/api/invoices/",
+        json={
+            "voucher_type": "purchase",
+            "ledger_id": partial_offset_ledger,
+            "supplier_invoice_number": "PO-PUR-1",
+            "invoice_date": today.isoformat(),
+            "items": [{"product_id": product, "quantity": 1, "unit_price": 100, "gst_rate": 0}],
+        },
+    ).status_code == 200
+
+    # 3. Not yet due customer (150 receivable, no payable) -> in outstanding, not overdue.
+    assert client.post(
+        "/api/invoices/",
+        json={
+            "voucher_type": "sales",
+            "ledger_id": upcoming_ledger,
+            "invoice_date": today.isoformat(),
+            "due_date": future_due_date,
+            "items": [{"product_id": product, "quantity": 1, "unit_price": 150, "gst_rate": 0}],
+        },
+    ).status_code == 200
+
+    receivables = client.get("/api/dashboard/metrics").json()["receivables"]
+    ageing = client.get("/api/invoices/dues/ageing").json()
+    ageing_overdue_amount, ageing_overdue_count = _overdue_bucket_totals(ageing)
+
+    assert ageing["total_remaining"] == 450
+    assert ageing_overdue_amount == 300
+    assert ageing_overdue_count == 1
+    assert receivables["outstanding_amount"] == ageing["total_remaining"]
+    assert receivables["overdue_amount"] == ageing_overdue_amount
+    assert receivables["overdue_count"] == ageing_overdue_count
+    assert receivables["unpaid_count"] == 3

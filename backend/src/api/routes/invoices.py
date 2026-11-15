@@ -1,7 +1,7 @@
 import csv
 import logging
 from io import BytesIO, StringIO
-from datetime import date, datetime
+from datetime import date
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -39,8 +39,7 @@ from src.services.gst_tax_service import india_today
 from src.services.invoice_payments import (
     build_invoice_payment_summaries,
     invoice_has_tds_allocated,
-    is_offset_by_payables,
-    open_amounts_by_ledger,
+    outstanding_due_invoices as _outstanding_due_invoices,
 )
 from src.services.pdf_templates import (
     _build_invoice_html,
@@ -465,65 +464,6 @@ def export_invoices_csv(
         raise HTTPException(status_code=500, detail="Failed to export invoices")
 
 
-def _outstanding_due_invoices(
-    db: Session,
-    company_id: int,
-    search: str = "",
-    ledger_id: int | None = None,
-    due_date_from: date | None = None,
-    due_date_to: date | None = None,
-):
-    """Shared dues query for the list and the ageing summary.
-
-    Returns the outstanding sales invoices, after dropping invoices with
-    nothing remaining and ledgers whose receivable is fully offset by payables.
-    An invoice with no due date counts as due on its invoice date. Both surfaces
-    read the same rows, so the tiles and the list can never disagree about which
-    invoices count.
-    """
-    effective_due_date = func.coalesce(Invoice.due_date, Invoice.invoice_date)
-    base = (
-        db.query(Invoice)
-        .options(joinedload(Invoice.ledger), joinedload(Invoice.items))
-        .filter(
-            Invoice.company_id == company_id,
-            Invoice.voucher_type == "sales",
-            Invoice.status == "active",
-        )
-    )
-
-    if ledger_id is not None:
-        base = base.filter(Invoice.ledger_id == ledger_id)
-    if search.strip():
-        base = base.filter(Invoice.ledger_name.ilike(f"%{search.strip()}%"))
-    if due_date_from is not None:
-        base = base.filter(effective_due_date >= datetime.combine(due_date_from, datetime.min.time()))
-    if due_date_to is not None:
-        base = base.filter(effective_due_date <= datetime.combine(due_date_to, datetime.max.time()))
-
-    invoices = base.order_by(effective_due_date.asc(), Invoice.invoice_date.asc(), Invoice.id.asc()).all()
-    payment_summaries = build_invoice_payment_summaries(db, invoices)
-    outstanding_invoices = [
-        invoice
-        for invoice in invoices
-        if payment_summaries[invoice.id].remaining_amount > 0
-    ]
-
-    # Ledgers that are also suppliers: what we owe them is shown next to the dues,
-    # and a ledger whose receivable is fully offset by payables is not chased.
-    open_amounts = open_amounts_by_ledger(
-        db,
-        list({invoice.ledger_id for invoice in outstanding_invoices if invoice.ledger_id is not None}),
-        company_id=company_id,
-    )
-    outstanding_invoices = [
-        invoice
-        for invoice in outstanding_invoices
-        if not is_offset_by_payables(*open_amounts.get(invoice.ledger_id, (0.0, 0.0)))
-    ]
-    return outstanding_invoices, payment_summaries, open_amounts
-
-
 _AGEING_BUCKETS = [
     ("not_yet_due", "Not yet due"),
     ("1_30", "1 to 30 days overdue"),
@@ -569,6 +509,7 @@ def dues_ageing_summary(
             ledger_id=ledger_id,
             due_date_from=due_date_from,
             due_date_to=due_date_to,
+            eager_load=False,
         )
         totals: dict[str, Decimal] = {key: Decimal("0") for key, _ in _AGEING_BUCKETS}
         counts: dict[str, int] = {key: 0 for key, _ in _AGEING_BUCKETS}

@@ -25,7 +25,7 @@ from src.schemas.dashboard import (
     TopProduct,
 )
 from src.services.analytics_reports import apportioned_invoice_rows, month_label, month_window
-from src.services.invoice_payments import build_invoice_payment_summaries
+from src.services.invoice_payments import outstanding_due_invoices
 
 router = APIRouter()
 
@@ -135,33 +135,25 @@ def get_dashboard_metrics(
         average_invoice_value=float(total_sales / sales_count) if sales_count else 0.0,
     )
 
-    # --- Receivables (reuses the canonical outstanding calculation) ------
-    active_sales = (
-        db.query(Invoice)
-        .filter(
-            Invoice.company_id == company_id,
-            Invoice.voucher_type == "sales",
-            Invoice.status == "active",
-        )
-        .all()
-    )
-    summaries = build_invoice_payment_summaries(db, active_sales)
-    outstanding_amount = Decimal("0")
-    overdue_amount = Decimal("0")
-    overdue_count = 0
+    # --- Receivables (shares the canonical dues definition) --------------
+    due_invoices, summaries, _ = outstanding_due_invoices(db, company_id, eager_load=False)
     paid_count = partial_count = unpaid_count = 0
-    for invoice in active_sales:
-        summary = summaries[invoice.id]
-        remaining = Decimal(str(summary.remaining_amount or 0))
-        outstanding_amount += remaining
+    for summary in summaries.values():
         if summary.payment_status == "paid":
             paid_count += 1
         elif summary.payment_status == "partial":
             partial_count += 1
         else:
             unpaid_count += 1
+
+    outstanding_amount = Decimal("0")
+    overdue_amount = Decimal("0")
+    overdue_count = 0
+    for invoice in due_invoices:
+        remaining = Decimal(str(summaries[invoice.id].remaining_amount or 0))
+        outstanding_amount += remaining
         # An invoice with no due date counts as due on its invoice date, as on Dues.
-        if remaining > 0 and (invoice.due_date or invoice.invoice_date).date() < today:
+        if (invoice.due_date or invoice.invoice_date).date() < today:
             overdue_amount += remaining
             overdue_count += 1
     receivables = ReceivablesMetrics(

@@ -4,7 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import HTTPException
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from src.models.credit_note import CreditNote, CreditNoteItem
 from src.models.invoice import Invoice
@@ -194,6 +194,66 @@ def open_amounts_by_ledger(
 def is_offset_by_payables(receivable: float, payable: float) -> bool:
     """True when a ledger owes us nothing net because open payables cover its receivable."""
     return payable > 0 and round(receivable - payable, 2) <= 0
+
+
+def outstanding_due_invoices(
+    db: Session,
+    company_id: int,
+    search: str = "",
+    ledger_id: int | None = None,
+    due_date_from: date | None = None,
+    due_date_to: date | None = None,
+    *,
+    eager_load: bool = True,
+) -> tuple[list[Invoice], dict[int, InvoicePaymentSummary], dict[int, tuple[float, float]]]:
+    """Shared dues query for the dues list, ageing summary, and dashboard totals.
+
+    Returns the outstanding sales invoices, after dropping invoices with
+    nothing remaining and ledgers whose receivable is fully offset by payables.
+    An invoice with no due date counts as due on its invoice date. All surfaces
+    read the same rows, so the tiles and the list can never disagree about which
+    invoices count.
+    """
+    effective_due_date = func.coalesce(Invoice.due_date, Invoice.invoice_date)
+    base = db.query(Invoice)
+    if eager_load:
+        base = base.options(joinedload(Invoice.ledger), joinedload(Invoice.items))
+    base = base.filter(
+        Invoice.company_id == company_id,
+        Invoice.voucher_type == "sales",
+        Invoice.status == "active",
+    )
+
+    if ledger_id is not None:
+        base = base.filter(Invoice.ledger_id == ledger_id)
+    if search.strip():
+        base = base.filter(Invoice.ledger_name.ilike(f"%{search.strip()}%"))
+    if due_date_from is not None:
+        base = base.filter(effective_due_date >= datetime.combine(due_date_from, datetime.min.time()))
+    if due_date_to is not None:
+        base = base.filter(effective_due_date <= datetime.combine(due_date_to, datetime.max.time()))
+
+    invoices = base.order_by(effective_due_date.asc(), Invoice.invoice_date.asc(), Invoice.id.asc()).all()
+    payment_summaries = build_invoice_payment_summaries(db, invoices)
+    outstanding_invoices = [
+        invoice
+        for invoice in invoices
+        if payment_summaries[invoice.id].remaining_amount > 0
+    ]
+
+    # Ledgers that are also suppliers: what we owe them is shown next to the dues,
+    # and a ledger whose receivable is fully offset by payables is not chased.
+    open_amounts = open_amounts_by_ledger(
+        db,
+        list({invoice.ledger_id for invoice in outstanding_invoices if invoice.ledger_id is not None}),
+        company_id=company_id,
+    )
+    outstanding_invoices = [
+        invoice
+        for invoice in outstanding_invoices
+        if invoice.ledger_id is None or not is_offset_by_payables(*open_amounts.get(invoice.ledger_id, (0.0, 0.0)))
+    ]
+    return outstanding_invoices, payment_summaries, open_amounts
 
 
 def get_outstanding_invoices_for_ledger(
